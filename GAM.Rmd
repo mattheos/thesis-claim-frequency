@@ -1,0 +1,106 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(dplyr)
+library(MASS)
+library(gam)
+library(mgcv)
+
+
+data <- read.csv("C:/Users/matth/OneDrive/Desktop/Books/Thesis/freMTPL2freq.csv", header = TRUE)
+
+df <- data %>%
+  mutate(
+    ClaimFreq = ClaimNb / Exposure,
+    VehBrand = as.factor(VehBrand),
+    VehGas   = as.factor(VehGas),
+    Area     = as.factor(Area),
+    Region   = as.factor(Region)
+  )
+```
+
+
+-------------------------------------------------------------------------------------------------------
+```{r}
+gam_poisson_1 <- gam(
+  ClaimNb ~ s(VehPower) + VehAge + DrivAge + 
+    BonusMalus + VehBrand + VehGas + Area +Region,
+  offset = log(Exposure),
+  family = poisson(link = "log"),
+  data = df,
+  method = "REML"
+)
+```
+
+```{r}
+summary(gam_poisson_1)
+```
+
+```{r}
+anova(gam_poisson_1)
+```
+
+-------------------------------------------------------------------------------------------------------
+
+```{r}
+gam_poisson_2 <- gam(
+  ClaimNb ~ s(VehPower) + s(VehAge) + DrivAge + 
+    BonusMalus + VehBrand + VehGas + Area +Region,
+  offset = log(Exposure),
+  family = poisson(link = "log"),
+  data = df,
+  method = "REML"
+)
+```
+
+```{r}
+summary(gam_poisson_2)
+```
+
+```{r}
+anova(gam_poisson_2)
+```
+-------------------------------------------------------------------------------------------------------
+
+```{r}
+gam_poisson_3 <- gam(
+  ClaimNb ~ s(VehPower) + s(VehAge) + s(DrivAge) + 
+    BonusMalus + VehBrand + VehGas + Area +Region,
+  offset = log(Exposure),
+  family = poisson(link = "log"),
+  data = df,
+  method = "REML"
+)
+```
+```{r}
+summary(gam_poisson_3)
+```
+```{r}
+anova(gam_poisson_3)
+```
+-------------------------------------------------------------------------------------------------------
+
+```{r}
+gam_poisson_4 <- gam(
+  ClaimNb ~ s(VehPower) + s(VehAge) + s(DrivAge) + 
+    s(BonusMalus) + VehBrand + VehGas + Area +Region,
+  offset = log(Exposure),
+  family = poisson(link = "log"),
+  data = df,
+  method = "REML"
+)
+```
+
+```{r}
+summary(gam_poisson_4)
+```
+```{r}
+anova(gam_poisson_4)
+```
+
+```{r}
+AIC(gam_poisson_1,gam_poisson_2,gam_poisson_3,gam_poisson_4)
+```
+

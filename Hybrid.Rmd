@@ -1,0 +1,892 @@
+```{r}
+# =========================================================
+# CHUNK 1: SETUP AND LIBRARIES
+# =========================================================
+
+library(gbm)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+
+data <- read.csv(
+  "C:/Users/matth/OneDrive/Desktop/Books/Thesis/Data/freMTPL2freq.csv",
+  header = TRUE
+)
+
+df <- data %>%
+  mutate(
+    ClaimFreq = ClaimNb / Exposure,
+    VehBrand  = as.factor(VehBrand),
+    VehGas    = as.factor(VehGas),
+    Area      = as.factor(Area),
+    Region    = as.factor(Region)
+  )
+```
+
+
+```{r}
+# =========================================================
+# CHUNK 2: EVALUATION FUNCTIONS
+# =========================================================
+
+poisson_deviance <- function(y, mu) {
+  mu   <- pmax(mu, 1e-10)
+  term <- ifelse(
+    y == 0,
+    mu,
+    y * log(y / mu) - (y - mu)
+  )
+  2 * sum(term)
+}
+
+poisson_deviance_per_obs <- function(y, mu) {
+  poisson_deviance(y, mu) / length(y)
+}
+
+rmse <- function(y, yhat) {
+  sqrt(mean((y - yhat)^2))
+}
+
+extract_cv_deviance <- function(gbm_model, best_iter, n_train) {
+  cv_dev_per_obs <- gbm_model$cv.error[best_iter]
+  cv_dev_scaled  <- cv_dev_per_obs * n_train
+  return(list(
+    per_obs = cv_dev_per_obs,
+    scaled  = cv_dev_scaled
+  ))
+}
+
+convergence_check <- function(best_iter, max_trees) {
+  if (best_iter == max_trees) {
+    cat(
+      "WARNING: Model did NOT converge.",
+      "Best iteration equals tree limit.\n",
+      "Reported performance is a lower bound.\n"
+    )
+  } else {
+    cat(
+      "Model converged at iteration",
+      best_iter, "out of", max_trees, "\n"
+    )
+  }
+}
+
+evaluate_hybrid <- function(
+    model_name,
+    gbm_model,
+    best_iter,
+    max_trees,
+    train_pred,
+    test_pred,
+    glm_test_pred,
+    y_train,
+    y_test
+) {
+  
+  cat("\n========================================\n")
+  cat("EVALUATION:", model_name, "\n")
+  cat("========================================\n")
+  
+  # Convergence
+  convergence_check(best_iter, max_trees)
+  
+  # CV Deviance
+  cv_info <- extract_cv_deviance(
+    gbm_model, best_iter, length(y_train)
+  )
+  cat("\nCV Deviance (per obs):   ",
+      round(cv_info$per_obs, 6), "\n")
+  cat("CV Deviance (scaled):    ",
+      round(cv_info$scaled, 2), "\n")
+  
+  # Train Deviance
+  train_dev     <- poisson_deviance(y_train, train_pred)
+  train_dev_obs <- poisson_deviance_per_obs(y_train, train_pred)
+  cat("\nTrain Deviance:          ",
+      round(train_dev, 2), "\n")
+  cat("Train Deviance (per obs):",
+      round(train_dev_obs, 6), "\n")
+  
+  # Train/CV Gap
+  gap <- cv_info$per_obs - train_dev_obs
+  cat("\nTrain/CV Gap (per obs):  ",
+      round(gap, 6),
+      "(positive = overfitting)\n")
+  
+  # GLM Baseline
+  glm_test_dev  <- poisson_deviance(y_test, glm_test_pred)
+  glm_test_rmse <- rmse(y_test, glm_test_pred)
+  cat("\n--- GLM Baseline (Stage 1) ---\n")
+  cat("Test Deviance:           ",
+      round(glm_test_dev, 2), "\n")
+  cat("Test Deviance (per obs): ",
+      round(glm_test_dev / length(y_test), 6), "\n")
+  cat("Test RMSE:               ",
+      round(glm_test_rmse, 6), "\n")
+  
+  # Hybrid Performance
+  hybrid_test_dev  <- poisson_deviance(y_test, test_pred)
+  hybrid_test_rmse <- rmse(y_test, test_pred)
+  cat("\n--- Hybrid Model (Stage 1 + Stage 2) ---\n")
+  cat("Test Deviance:           ",
+      round(hybrid_test_dev, 2), "\n")
+  cat("Test Deviance (per obs): ",
+      round(hybrid_test_dev / length(y_test), 6), "\n")
+  cat("Test RMSE:               ",
+      round(hybrid_test_rmse, 6), "\n")
+  
+  # Improvement over GLM
+  improvement     <- glm_test_dev - hybrid_test_dev
+  improvement_pct <- 100 * improvement / glm_test_dev
+  cat("\nImprovement over GLM:    ",
+      round(improvement, 2),
+      "(", round(improvement_pct, 3), "%)\n")
+  
+  return(data.frame(
+    Model             = model_name,
+    Best_Iter         = best_iter,
+    Converged         = (best_iter < max_trees),
+    CV_Dev_per_obs    = round(cv_info$per_obs, 6),
+    Train_Dev_per_obs = round(train_dev_obs, 6),
+    TrainCV_Gap       = round(gap, 6),
+    GLM_Test_Dev      = round(glm_test_dev, 2),
+    Hybrid_Test_Dev   = round(hybrid_test_dev, 2),
+    GLM_Test_RMSE     = round(glm_test_rmse, 6),
+    Hybrid_Test_RMSE  = round(hybrid_test_rmse, 6),
+    Improvement_pct   = round(improvement_pct, 3)
+  ))
+}
+
+```
+
+```{r}
+# =========================================================
+# CHUNK 3: TRAIN/TEST SPLIT
+# =========================================================
+
+set.seed(123)
+train_index <- createDataPartition(
+  df$ClaimNb,
+  p    = 0.80,
+  list = FALSE
+)
+
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+# Log transform Density
+train$LogDensity <- log1p(train$Density)
+test$LogDensity  <- log1p(test$Density)
+```
+
+```{r}
+# =========================================================
+# CHUNK 4: MODEL 1 - HYBRID WITH DENSITY
+# =========================================================
+
+# ---------------------------------------------------------
+# STAGE 1: GLM WITH DENSITY
+# ---------------------------------------------------------
+
+glm_density <- glm(
+  ClaimNb ~
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    LogDensity +
+    Region,
+  family = poisson(link = "log"),
+  offset = log(Exposure),
+  data   = train
+)
+
+train$glm_link_density <- predict(
+  glm_density,
+  newdata = train,
+  type    = "link"
+) - log(train$Exposure)
+
+test$glm_link_density <- predict(
+  glm_density,
+  newdata = test,
+  type    = "link"
+) - log(test$Exposure)
+
+train$glm_pred_density <- predict(
+  glm_density,
+  newdata = train,
+  type    = "response"
+)
+
+test$glm_pred_density <- predict(
+  glm_density,
+  newdata = test,
+  type    = "response"
+)
+
+# ---------------------------------------------------------
+# STAGE 2: GBM WITH DENSITY
+# ---------------------------------------------------------
+
+gbm_density <- gbm(
+  ClaimNb ~
+    offset(log(Exposure) + glm_link_density) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    LogDensity +
+    Region,
+  distribution      = "poisson",
+  data              = train,
+  n.trees           = 12000,
+  interaction.depth = 5,
+  shrinkage         = 0.010,
+  bag.fraction      = 0.7,
+  n.minobsinnode    = 100,
+  cv.folds          = 5,
+  verbose           = FALSE
+)
+
+best_iter_density <- gbm.perf(
+  gbm_density,
+  method = "cv"
+)
+
+
+```
+
+
+
+```{r}
+# =========================================================
+# CHUNK 5: MODEL 2 - HYBRID WITHOUT DENSITY
+# =========================================================
+
+# ---------------------------------------------------------
+# STAGE 1: GLM WITHOUT DENSITY
+# ---------------------------------------------------------
+
+glm_no_density <- glm(
+  ClaimNb ~
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region,
+  family = poisson(link = "log"),
+  offset = log(Exposure),
+  data   = train
+)
+
+train$glm_link_no_density <- predict(
+  glm_no_density,
+  newdata = train,
+  type    = "link"
+) - log(train$Exposure)
+
+test$glm_link_no_density <- predict(
+  glm_no_density,
+  newdata = test,
+  type    = "link"
+) - log(test$Exposure)
+
+train$glm_pred_no_density <- predict(
+  glm_no_density,
+  newdata = train,
+  type    = "response"
+)
+
+test$glm_pred_no_density <- predict(
+  glm_no_density,
+  newdata = test,
+  type    = "response"
+)
+
+# ---------------------------------------------------------
+# STAGE 2: GBM WITHOUT DENSITY
+# ---------------------------------------------------------
+
+gbm_no_density <- gbm(
+  ClaimNb ~
+    offset(log(Exposure) + glm_link_no_density) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region,
+  distribution      = "poisson",
+  data              = train,
+  n.trees           = 12000,
+  interaction.depth = 5,
+  shrinkage         = 0.01,
+  bag.fraction      = 0.7,
+  n.minobsinnode    = 100,
+  cv.folds          = 5,
+  verbose           = FALSE
+)
+
+best_iter_no_density <- gbm.perf(
+  gbm_no_density,
+  method = "cv"
+)
+
+
+```
+
+
+
+
+```{r}
+# =========================================================
+# CHUNK 6: FINAL COMPARISON TABLE
+# =========================================================
+
+final_table <- rbind(
+  results_density,
+  results_no_density
+)
+
+cat("\n========================================\n")
+cat("FINAL COMPARISON TABLE\n")
+cat("========================================\n")
+print(final_table, row.names = FALSE)
+```
+
+
+
+---------------------------------------------------------------------------------------------------------
+#Graphs
+---------------------------------------------------------------------------------------------------------
+
+
+
+
+
+
+```{r}
+library(dplyr)
+
+decile_df <- data.frame(
+  Actual = test$ClaimNb,
+  Predicted = test_pred_density
+)
+
+decile_df <- decile_df %>%
+  mutate(
+    Decile = ntile(Predicted, 10)
+  )
+
+calibration <- decile_df %>%
+  group_by(Decile) %>%
+  summarise(
+    Actual = mean(Actual),
+    Predicted = mean(Predicted)
+  )
+
+calibration_long <- pivot_longer(
+  calibration,
+  cols = c(Actual, Predicted),
+  names_to = "Type",
+  values_to = "Claims"
+)
+
+ggplot(
+  calibration_long,
+  aes(
+    x = Decile,
+    y = Claims,
+    color = Type
+  )
+) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Observed vs Predicted Claims by Risk Decile",
+    x = "Predicted Risk Decile",
+    y = "Average Claim Count"
+  )
+```
+
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+imp_density <- summary(gbm_density, plotit = FALSE)
+imp_no_density <- summary(gbm_no_density, plotit = FALSE)
+
+names(imp_density) <- c("Variable", "Importance")
+names(imp_no_density) <- c("Variable", "Importance")
+
+imp_density$Model <- "With Density"
+imp_no_density$Model <- "Without Density"
+
+importance_df <- bind_rows(
+  imp_density,
+  imp_no_density
+)
+
+hyb_var_plot <-  ggplot(
+    importance_df,
+    aes(
+      x = reorder(Variable, Importance),
+      y = Importance,
+      fill = Model
+    )
+  ) +
+    geom_col(
+      position = "dodge"
+    ) +
+    coord_flip() +
+    labs(
+      title = "Variable Importance Comparison",
+      x = "",
+      y = "Relative Influence (%)"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "top"
+    )
+  
+  ggsave(
+    "Figure8_Hybrid_Variable_Importance.pdf",
+    plot = hyb_var_plot,
+    width = 8,
+    height = 6
+  )
+```
+
+
+
+```{r}
+library(dplyr)
+
+calibration <- data.frame(
+  observed = test$ClaimNb,
+  predicted = test_pred_no_density
+)
+
+calibration <- calibration %>%
+  mutate(
+    decile = ntile(predicted, 10)
+  ) %>%
+  group_by(decile) %>%
+  summarise(
+    Observed = mean(observed),
+    Predicted = mean(predicted)
+  )
+
+ggplot(
+  calibration,
+  aes(
+    x = Predicted,
+    y = Observed
+  )
+) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Calibration Plot: Hybrid WITHOUT Density",
+    x = "Predicted Frequency",
+    y = "Observed Frequency"
+  )
+```
+
+```{r}
+# =============================================================================
+# HYBRID MODEL — ALL PLOTS FOR SECTION 5.4
+# =============================================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(gbm)
+
+# =============================================================================
+# FIGURE 6: LEARNING CURVES
+# =============================================================================
+
+png(
+  "figure6_learning_curves.png",
+  width  = 1400,
+  height = 600,
+  res    = 150
+)
+
+par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+
+gbm.perf(gbm_density,    method = "cv")
+title(main = "Hybrid WITH Density")
+
+gbm.perf(gbm_no_density, method = "cv")
+title(main = "Hybrid WITHOUT Density")
+
+par(mfrow = c(1, 1))
+dev.off()
+
+cat("Figure 6 saved.\n")
+
+# =============================================================================
+# FIGURE 7: TEST DEVIANCE COMPARISON BAR CHART
+# =============================================================================
+
+n_test <- length(test$ClaimNb)
+
+fig7_df <- data.frame(
+  Model = c(
+    "GLM\n(With Density)",
+    "GLM\n(Without Density)",
+    "Hybrid\n(With Density)",
+    "Hybrid\n(Without Density)"
+  ),
+  Deviance = c(
+    poisson_deviance(test$ClaimNb, test$glm_pred_density)    / n_test,
+    poisson_deviance(test$ClaimNb, test$glm_pred_no_density) / n_test,
+    poisson_deviance(test$ClaimNb, test_pred_density)        / n_test,
+    poisson_deviance(test$ClaimNb, test_pred_no_density)     / n_test
+  ),
+  Type = c("GLM Baseline", "GLM Baseline", "Hybrid", "Hybrid")
+)
+
+# Order bars by deviance descending (worst to best left to right)
+fig7_df$Model <- factor(
+  fig7_df$Model,
+  levels = fig7_df$Model[order(fig7_df$Deviance, decreasing = TRUE)]
+)
+
+fig7 <- ggplot(fig7_df,
+               aes(x = Model, y = Deviance, fill = Type)) +
+  geom_col(width = 0.55) +
+  geom_text(
+    aes(label = round(Deviance, 5)),
+    vjust = -0.5,
+    size  = 3.5
+  ) +
+  scale_fill_manual(values = c(
+    "GLM Baseline" = "#B0C4DE",
+    "Hybrid"       = "#2F4F7F"
+  )) +
+  scale_y_continuous(
+    limits = c(0.295, 0.320),
+    oob    = scales::squish,
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position    = "bottom",
+    panel.grid.major.x = element_blank(),
+    plot.title         = element_text(face = "bold", size = 13),
+    plot.subtitle      = element_text(size = 10, colour = "grey40")
+  ) +
+  labs(
+    title    = "Test-Set Poisson Deviance per Observation",
+    subtitle = "Hybrid vs GLM baseline — With and Without Density",
+    x        = NULL,
+    y        = "Poisson Deviance (per obs)",
+    fill     = "Model Type"
+  )
+
+ggsave(
+  "figure7_deviance_comparison.png",
+  fig7,
+  width  = 8,
+  height = 5,
+  dpi    = 150
+)
+
+cat("Figure 7 saved.\n")
+
+# =============================================================================
+# FIGURE 8: VARIABLE IMPORTANCE — SIDE BY SIDE
+# =============================================================================
+
+imp_with <- summary(
+  gbm_density,
+  n.trees = best_iter_density,
+  plotit  = FALSE
+)
+
+imp_without <- summary(
+  gbm_no_density,
+  n.trees = best_iter_no_density,
+  plotit  = FALSE
+)
+
+colnames(imp_with)    <- c("Variable", "Influence")
+colnames(imp_without) <- c("Variable", "Influence")
+
+imp_with$Model    <- "With Density"
+imp_without$Model <- "Without Density"
+
+imp_df <- rbind(imp_with, imp_without)
+
+# Reorder variables within each facet by influence
+imp_df <- imp_df %>%
+  group_by(Model) %>%
+  mutate(Variable = reorder(Variable, Influence)) %>%
+  ungroup()
+
+fig8 <- ggplot(imp_df,
+               aes(x    = Variable,
+                   y    = Influence,
+                   fill = Model)) +
+  geom_col(show.legend = FALSE, width = 0.65) +
+  facet_wrap(~ Model, scales = "free_y") +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "With Density"    = "#2F4F7F",
+    "Without Density" = "#5F8FA0"
+  )) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text         = element_text(face = "bold", size = 11),
+    panel.grid.major.y = element_blank(),
+    plot.title         = element_text(face = "bold", size = 13),
+    plot.subtitle      = element_text(size = 10, colour = "grey40")
+  ) +
+  labs(
+    title    = "GBM Stage Variable Importance",
+    subtitle = "Relative influence (%) — Hybrid WITH vs WITHOUT Density",
+    x        = NULL,
+    y        = "Relative Influence (%)"
+  )
+
+ggsave(
+  "figure8_variable_importance.png",
+  fig8,
+  width  = 11,
+  height = 5,
+  dpi    = 150
+)
+
+cat("Figure 8 saved.\n")
+
+# =============================================================================
+# FIGURE 9a: PARTIAL DEPENDENCE PLOTS — CONTINUOUS PREDICTORS
+# BonusMalus, VehAge, VehPower
+# =============================================================================
+
+continuous_vars <- c("BonusMalus", "VehAge", "VehPower")
+
+pdp_list <- lapply(continuous_vars, function(var) {
+  pd <- plot(
+    gbm_no_density,
+    i.var        = var,
+    n.trees      = best_iter_no_density,
+    return.grid  = TRUE
+  )
+  colnames(pd) <- c("x", "y")
+  pd$Variable  <- var
+  pd$x         <- as.numeric(pd$x)
+  pd
+})
+
+pdp_df <- do.call(rbind, pdp_list)
+
+# Nice facet labels
+pdp_df$Variable <- factor(
+  pdp_df$Variable,
+  levels = c("BonusMalus", "VehAge", "VehPower"),
+  labels = c("BonusMalus", "Vehicle Age", "Vehicle Power")
+)
+
+fig9a <- ggplot(pdp_df,
+                aes(x = x, y = y)) +
+  geom_line(colour = "#2F4F7F", linewidth = 1.1) +
+  geom_rug(
+    sides  = "b",
+    alpha  = 0.15,
+    colour = "grey50",
+    length = unit(0.03, "npc")
+  ) +
+  facet_wrap(~ Variable, scales = "free_x") +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text    = element_text(face = "bold", size = 11),
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40")
+  ) +
+  labs(
+    title    = "Partial Dependence Plots — Continuous Predictors",
+    subtitle = "Hybrid WITHOUT Density model; marginal effect on log claim rate",
+    x        = "Predictor Value",
+    y        = "Partial Effect (log scale)"
+  )
+
+ggsave(
+  "figure9a_pdp_continuous.png",
+  fig9a,
+  width  = 12,
+  height = 4,
+  dpi    = 150
+)
+
+cat("Figure 9a saved.\n")
+
+# =============================================================================
+# FIGURE 9b: PARTIAL DEPENDENCE PLOT — VehBrand (CATEGORICAL)
+# =============================================================================
+
+pdp_brand <- plot(
+  gbm_no_density,
+  i.var       = "VehBrand",
+  n.trees     = best_iter_no_density,
+  return.grid = TRUE
+)
+
+colnames(pdp_brand) <- c("VehBrand", "y")
+pdp_brand$VehBrand  <- as.character(pdp_brand$VehBrand)
+
+fig9b <- ggplot(pdp_brand,
+                aes(x    = reorder(VehBrand, y),
+                    y    = y)) +
+  geom_col(fill = "#2F4F7F", width = 0.65) +
+  geom_text(
+    aes(label = round(y, 3)),
+    hjust = ifelse(pdp_brand$y[order(pdp_brand$y)] >= 0, -0.1, 1.1),
+    size  = 3.2
+  ) +
+  coord_flip() +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title         = element_text(face = "bold", size = 13),
+    plot.subtitle      = element_text(size = 10, colour = "grey40")
+  ) +
+  labs(
+    title    = "Partial Dependence Plot — Vehicle Brand",
+    subtitle = "Hybrid WITHOUT Density model; marginal effect on log claim rate",
+    x        = "Vehicle Brand",
+    y        = "Partial Effect (log scale)"
+  )
+
+ggsave(
+  "figure9b_pdp_vehbrand.png",
+  fig9b,
+  width  = 7,
+  height = 5,
+  dpi    = 150
+)
+
+cat("Figure 9b saved.\n")
+
+# =============================================================================
+# FIGURE 10: DECILE CALIBRATION — BOTH HYBRID MODELS
+# =============================================================================
+
+make_calibration <- function(actual, predicted, model_label) {
+  df <- data.frame(
+    Actual    = actual,
+    Predicted = predicted
+  )
+  df$Decile <- ntile(df$Predicted, 10)
+
+  df %>%
+    group_by(Decile) %>%
+    summarise(
+      Observed  = mean(Actual),
+      Predicted = mean(Predicted),
+      .groups   = "drop"
+    ) %>%
+    pivot_longer(
+      cols      = c(Observed, Predicted),
+      names_to  = "Type",
+      values_to = "Value"
+    ) %>%
+    mutate(Model = model_label)
+}
+
+calib_with    <- make_calibration(
+  test$ClaimNb,
+  test_pred_density,
+  "With Density"
+)
+
+calib_without <- make_calibration(
+  test$ClaimNb,
+  test_pred_no_density,
+  "Without Density"
+)
+
+calib_all <- rbind(calib_with, calib_without)
+
+fig10 <- ggplot(calib_all,
+                aes(x        = Decile,
+                    y        = Value,
+                    colour   = Type,
+                    linetype = Type)) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ Model) +
+  scale_colour_manual(values = c(
+    "Observed"  = "#2F4F7F",
+    "Predicted" = "#E07B39"
+  )) +
+  scale_linetype_manual(values = c(
+    "Observed"  = "solid",
+    "Predicted" = "dashed"
+  )) +
+  scale_x_continuous(breaks = 1:10) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text      = element_text(face = "bold", size = 11),
+    legend.position = "bottom",
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40")
+  ) +
+  labs(
+    title    = "Decile Calibration Plot",
+    subtitle = "Mean observed vs predicted claim frequency by risk decile",
+    x        = "Predicted Risk Decile",
+    y        = "Mean Claim Frequency",
+    colour   = NULL,
+    linetype = NULL
+  )
+
+ggsave(
+  "figure10_calibration.png",
+  fig10,
+  width  = 10,
+  height = 5,
+  dpi    = 150
+)
+
+cat("Figure 10 saved.\n")
+
+# =============================================================================
+# CONFIRMATION
+# =============================================================================
+
+cat("\n--- All figures saved ---\n")
+cat("figure6_learning_curves.png\n")
+cat("figure7_deviance_comparison.png\n")
+cat("figure8_variable_importance.png\n")
+cat("figure9a_pdp_continuous.png\n")
+cat("figure9b_pdp_vehbrand.png\n")
+cat("figure10_calibration.png\n")
+```
+

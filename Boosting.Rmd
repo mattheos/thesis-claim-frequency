@@ -1,0 +1,851 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(gbm)
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(caret)
+
+
+data <- read.csv("C:/Users/matth/OneDrive/Desktop/Books/Thesis/Data/freMTPL2freq.csv", header = TRUE)
+
+df <- data %>%
+  mutate(
+    ClaimFreq = ClaimNb / Exposure,
+    VehBrand = as.factor(VehBrand),
+    VehGas   = as.factor(VehGas),
+    Area     = as.factor(Area),
+    Region   = as.factor(Region)
+  )
+```
+
+
+
+---------------------------------------------------------------------------------------------------------
+# COMPARE MULTIPLE GBM MODELS
+---------------------------------------------------------------------------------------------------------
+```{r}
+library(gbm)
+
+# =========================================================
+# TRAIN / TEST SPLIT
+# =========================================================
+
+set.seed(123)
+train_index <- createDataPartition(df$ClaimNb, p = 0.80, list = FALSE)
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+# =========================================================
+# POISSON DEVIANCE FUNCTION
+# =========================================================
+
+poisson_deviance <- function(y, mu) {
+  
+  mu <- pmax(mu, 1e-10)
+  
+  2 * sum(
+    ifelse(
+      y == 0,
+      mu,
+      y * log(y / mu) - (y - mu)
+    )
+  )
+}
+
+# =========================================================
+# MODEL 1 : CONSERVATIVE
+# =========================================================
+
+gbm_conservative <- gbm(
+  
+  ClaimNb ~
+    offset(log(Exposure)) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region +
+    Density,
+  
+  distribution = "poisson",
+  
+  data = train,
+  
+  n.trees = 15000,
+  interaction.depth = 1,
+  shrinkage = 0.003,
+  
+  bag.fraction = 0.6,
+  
+  n.minobsinnode = 200,
+  
+  cv.folds = 5,
+  
+  verbose = FALSE
+)
+
+best_conservative <- gbm.perf(
+  gbm_conservative,
+  method = "cv"
+)
+
+# =========================================================
+# MODEL 2 : BALANCED
+# =========================================================
+
+gbm_balanced <- gbm(
+  
+  ClaimNb ~
+    offset(log(Exposure)) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region +
+    Density,
+  
+  distribution = "poisson",
+  
+  data = train,
+  
+  n.trees = 8000,
+  interaction.depth = 3,
+  shrinkage = 0.01,
+  
+  bag.fraction = 0.7,
+  
+  n.minobsinnode = 100,
+  
+  cv.folds = 5,
+  
+  verbose = FALSE
+)
+
+best_balanced <- gbm.perf(
+  gbm_balanced,
+  method = "cv"
+)
+
+# =========================================================
+# MODEL 3 : INTERACTION HEAVY
+# =========================================================
+
+gbm_interaction <- gbm(
+  
+  ClaimNb ~
+    offset(log(Exposure)) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region +
+    Density,
+  
+  distribution = "poisson",
+  
+  data = train,
+  
+  n.trees = 5000,
+  interaction.depth = 6,
+  shrinkage = 0.02,
+  
+  bag.fraction = 0.5,
+  
+  n.minobsinnode = 50,
+  
+  cv.folds = 5,
+  
+  verbose = FALSE
+)
+
+best_interaction <- gbm.perf(
+  gbm_interaction,
+  method = "cv"
+)
+
+# =========================================================
+# MODEL 4 : VERY SMOOTH
+# =========================================================
+
+gbm_smooth <- gbm(
+  
+  ClaimNb ~
+    offset(log(Exposure)) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region +
+    Density,
+  
+  distribution = "poisson",
+  
+  data = train,
+  
+  n.trees = 25000,
+  interaction.depth = 2,
+  shrinkage = 0.001,
+  
+  bag.fraction = 0.8,
+  
+  n.minobsinnode = 300,
+  
+  cv.folds = 5,
+  
+  verbose = FALSE
+)
+
+best_smooth <- gbm.perf(
+  gbm_smooth,
+  method = "cv"
+)
+
+# =========================================================
+# MODEL 5 : REGULARIZED
+# =========================================================
+
+gbm_regularized <- gbm(
+  
+  ClaimNb ~
+    offset(log(Exposure)) +
+    VehPower +
+    VehAge +
+    DrivAge +
+    BonusMalus +
+    VehBrand +
+    VehGas +
+    Area +
+    Region +
+    Density,
+  
+  distribution = "poisson",
+  
+  data = train,
+  
+  n.trees = 12000,
+  interaction.depth = 3,
+  shrinkage = 0.005,
+  
+  bag.fraction = 0.4,
+  
+  n.minobsinnode = 500,
+  
+  cv.folds = 5,
+  
+  verbose = FALSE
+)
+
+best_regularized <- gbm.perf(
+  gbm_regularized,
+  method = "cv"
+)
+
+# =========================================================
+# TEST SET PREDICTIONS
+# =========================================================
+pred_conservative <- predict(
+  gbm_conservative,
+  newdata = test,
+  n.trees = best_conservative,
+  type = "response"
+)
+
+
+pred_balanced <- predict(
+  gbm_balanced,
+  newdata = test,
+  n.trees = best_balanced,
+  type = "response"
+)
+
+
+pred_interaction <- predict(
+  gbm_interaction,
+  newdata = test,
+  n.trees = best_interaction,
+  type = "response"
+)
+
+
+pred_smooth <- predict(
+  gbm_smooth,
+  newdata = test,
+  n.trees = best_smooth,
+  type = "response"
+)
+
+
+pred_regularized <- predict(
+  gbm_regularized,
+  newdata = test,
+  n.trees = best_regularized,
+  type = "response"
+)
+# =========================================================
+# POISSON DEVIANCE ON TEST SET
+# =========================================================
+
+dev_conservative <- poisson_deviance(
+  test$ClaimNb,
+  pred_conservative
+)
+
+dev_balanced <- poisson_deviance(
+  test$ClaimNb,
+  pred_balanced
+)
+
+dev_interaction <- poisson_deviance(
+  test$ClaimNb,
+  pred_interaction
+)
+
+dev_smooth <- poisson_deviance(
+  test$ClaimNb,
+  pred_smooth
+)
+
+dev_regularized <- poisson_deviance(
+  test$ClaimNb,
+  pred_regularized
+)
+
+# =========================================================
+# RESULTS TABLE
+# =========================================================
+
+results <- data.frame(
+  
+  Model = c(
+    "Conservative",
+    "Balanced",
+    "Interaction",
+    "Smooth",
+    "Regularized"
+  ),
+  
+  Trees = c(
+    best_conservative,
+    best_balanced,
+    best_interaction,
+    best_smooth,
+    best_regularized
+  ),
+  
+  Deviance = c(
+    dev_conservative,
+    dev_balanced,
+    dev_interaction,
+    dev_smooth,
+    dev_regularized
+  )
+)
+
+# Sort by best deviance
+results <- results[
+  order(results$Deviance),
+]
+
+# =========================================================
+# SHOW RESULTS
+# =========================================================
+
+print(results)
+
+# =========================================================
+# BEST MODEL
+# =========================================================
+
+best_model_name <- results$Model[1]
+
+cat(
+  "\nBEST MODEL:",
+  best_model_name,
+  "\n"
+)
+```
+```{r}
+# Variable importance for best model (Interaction)
+importance_interaction <- summary(
+  gbm_interaction,
+  n.trees = best_interaction,
+  plotit = FALSE
+)
+
+print(importance_interaction)
+```
+```{r}
+# =========================================================
+# DETAILED DIAGNOSTICS FOR ALL FIVE GBM MODELS
+# =========================================================
+
+models <- list(
+  Conservative = list(model = gbm_conservative, best = best_conservative),
+  Balanced     = list(model = gbm_balanced,     best = best_balanced),
+  Interaction  = list(model = gbm_interaction,  best = best_interaction),
+  Smooth       = list(model = gbm_smooth,       best = best_smooth),
+  Regularized  = list(model = gbm_regularized,  best = best_regularized)
+)
+
+for (name in names(models)) {
+  
+  m    <- models[[name]]$model
+  best <- models[[name]]$best
+  
+  cat("\n", paste(rep("=", 50), collapse = ""), "\n")
+  cat("MODEL:", name, "| Best trees:", best, "\n")
+  cat(paste(rep("=", 50), collapse = ""), "\n")
+  
+  # CV deviance at optimal iteration
+  cv_dev <- m$cv.error[best]
+  cat("CV Deviance at optimal iteration:", round(cv_dev, 6), "\n")
+  
+  # Training deviance at optimal iteration
+  train_dev <- m$train.error[best]
+  cat("Train Deviance at optimal iteration:", round(train_dev, 6), "\n")
+  
+  # Gap between train and CV (overfitting indicator)
+  cat("Train/CV gap:", round(cv_dev - train_dev, 6), "\n")
+  
+  # Variable importance
+  cat("\nVariable Importance:\n")
+  imp <- summary(m, n.trees = best, plotit = FALSE)
+  print(imp)
+  
+  # CV deviance at last iteration vs optimal (did it converge?)
+  cv_last  <- tail(m$cv.error, 1)
+  cat("\nCV Deviance at last iteration:", round(cv_last, 6), "\n")
+  cat("CV Deviance at optimal iteration:", round(cv_dev, 6), "\n")
+  cat("Difference (convergence check):", round(cv_last - cv_dev, 6), "\n")
+}
+```
+
+```{r}
+# =========================================================
+# FIGURE X: CV CONVERGENCE PLOTS (all 5 models, grid layout)
+# =========================================================
+
+par(mfrow = c(2, 3))
+
+gbm.perf(gbm_conservative, method = "cv")
+title(main = "Conservative")
+
+gbm.perf(gbm_balanced, method = "cv")
+title(main = "Balanced")
+
+gbm.perf(gbm_interaction, method = "cv")
+title(main = "Interaction")
+
+gbm.perf(gbm_smooth, method = "cv")
+title(main = "Smooth")
+
+gbm.perf(gbm_regularized, method = "cv")
+title(main = "Regularized")
+
+par(mfrow = c(1, 1))
+
+
+# =========================================================
+# TABLE X: MODEL DIAGNOSTICS SUMMARY
+# =========================================================
+
+diagnostics <- data.frame(
+  Model = c(
+    "Conservative", "Balanced", "Interaction", "Smooth", "Regularized"
+  ),
+  Best_Trees = c(
+    best_conservative, best_balanced, best_interaction,
+    best_smooth, best_regularized
+  ),
+  CV_Deviance = round(c(
+    gbm_conservative$cv.error[best_conservative],
+    gbm_balanced$cv.error[best_balanced],
+    gbm_interaction$cv.error[best_interaction],
+    gbm_smooth$cv.error[best_smooth],
+    gbm_regularized$cv.error[best_regularized]
+  ), 6),
+  Train_Deviance = round(c(
+    gbm_conservative$train.error[best_conservative],
+    gbm_balanced$train.error[best_balanced],
+    gbm_interaction$train.error[best_interaction],
+    gbm_smooth$train.error[best_smooth],
+    gbm_regularized$train.error[best_regularized]
+  ), 6),
+  Test_Deviance = round(c(
+    dev_conservative, dev_balanced, dev_interaction,
+    dev_smooth, dev_regularized
+  ), 2)
+)
+
+diagnostics$Train_CV_Gap <- round(
+  diagnostics$CV_Deviance - diagnostics$Train_Deviance,
+  6
+)
+
+diagnostics <- diagnostics[order(diagnostics$Test_Deviance), ]
+
+print(diagnostics)
+
+
+# =========================================================
+# FIGURE X: VARIABLE IMPORTANCE — BEST MODEL (INTERACTION)
+# =========================================================
+
+imp_interaction <- summary(
+  gbm_interaction,
+  n.trees = best_interaction,
+  plotit  = FALSE
+)
+
+imp_interaction <- imp_interaction[
+  order(imp_interaction$rel.inf, decreasing = TRUE),
+]
+
+imp_interaction$rel.inf <- round(imp_interaction$rel.inf, 2)
+
+par(mar = c(5, 8, 4, 2))
+
+bp <- barplot(
+  rev(imp_interaction$rel.inf),
+  names.arg = rev(imp_interaction$var),
+  horiz     = TRUE,
+  las       = 1,
+  col       = "steelblue",
+  xlab      = "Relative Influence (%)",
+  main      = "Variable Importance - Interaction GBM",
+  xlim      = c(0, max(imp_interaction$rel.inf) * 1.2)
+)
+
+text(
+  x      = rev(imp_interaction$rel.inf) + 0.4,
+  y      = bp,
+  labels = paste0(rev(imp_interaction$rel.inf), "%"),
+  cex    = 0.85,
+  adj    = 0
+)
+
+par(mar = c(5, 4, 4, 2))
+
+
+# =========================================================
+# FIGURE X: VARIABLE IMPORTANCE ALL 5 MODELS (grid)
+# =========================================================
+
+models_list <- list(
+  Conservative = list(model = gbm_conservative, best = best_conservative),
+  Balanced     = list(model = gbm_balanced,     best = best_balanced),
+  Interaction  = list(model = gbm_interaction,  best = best_interaction),
+  Smooth       = list(model = gbm_smooth,       best = best_smooth),
+  Regularized  = list(model = gbm_regularized,  best = best_regularized)
+)
+
+par(mfrow = c(2, 3), mar = c(4, 7, 3, 1))
+
+for (name in names(models_list)) {
+  
+  imp <- summary(
+    models_list[[name]]$model,
+    n.trees = models_list[[name]]$best,
+    plotit  = FALSE
+  )
+  
+  imp <- imp[order(imp$rel.inf, decreasing = TRUE), ]
+  imp$rel.inf <- round(imp$rel.inf, 2)
+  
+  bp <- barplot(
+    rev(imp$rel.inf),
+    names.arg = rev(imp$var),
+    horiz     = TRUE,
+    las       = 1,
+    col       = "steelblue",
+    xlab      = "Relative Influence (%)",
+    main      = paste("Variable Importance -", name),
+    xlim      = c(0, max(imp$rel.inf) * 1.2)
+  )
+  
+  text(
+    x      = rev(imp$rel.inf) + 0.4,
+    y      = bp,
+    labels = paste0(rev(imp$rel.inf), "%"),
+    cex    = 0.75,
+    adj    = 0
+  )
+}
+
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+```
+
+------------------------------------------------------------------------------------------------------------------------------
+#XGBOOST
+------------------------------------------------------------------------------------------------------------------------------
+
+```{r}
+# ============================================================
+# XGBOOST FOR INSURANCE CLAIM FREQUENCY
+# Exposure is included as an offset through base_margin
+# Tests up to 50 hyperparameter combinations using
+# 5-fold cross-validation and selects the best model
+# ============================================================
+
+library(xgboost)
+library(caret)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+
+# ------------------------------------------------------------
+# 1. TRAIN / TEST SPLIT (80/20)
+# ------------------------------------------------------------
+set.seed(123)
+
+train_index <- createDataPartition(df$ClaimNb, p = 0.80, list = FALSE)
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+# ------------------------------------------------------------
+# 2. MODEL MATRIX
+# Converts categorical variables to dummy variables
+# ------------------------------------------------------------
+xgb_formula <- ~ VehPower + VehAge + DrivAge + BonusMalus +
+  VehBrand + VehGas + Area + Region - 1
+
+X_train <- sparse.model.matrix(xgb_formula, data = train)
+X_test  <- sparse.model.matrix(xgb_formula, data = test)
+
+# Response variables
+y_train <- train$ClaimNb
+y_test  <- test$ClaimNb
+
+# ------------------------------------------------------------
+# 3. INCLUDE EXPOSURE AS OFFSET
+# base_margin = log(Exposure)
+# This ensures the model predicts:
+# E[ClaimNb] = Exposure × lambda
+# ------------------------------------------------------------
+offset_train <- log(train$Exposure)
+offset_test  <- log(test$Exposure)
+
+# Create DMatrix objects with exposure included
+dtrain <- xgb.DMatrix(
+  data = X_train,
+  label = y_train,
+  base_margin = offset_train
+)
+
+dtest <- xgb.DMatrix(
+  data = X_test,
+  label = y_test,
+  base_margin = offset_test
+)
+
+# ------------------------------------------------------------
+# 4. POISSON DEVIANCE FUNCTION
+# ------------------------------------------------------------
+poisson_deviance <- function(y, mu) {
+  mu <- pmax(mu, 1e-10)
+  term <- ifelse(y == 0, mu, y * log(y / mu) - (y - mu))
+  2 * sum(term)
+}
+
+# ------------------------------------------------------------
+# 5. HYPERPARAMETER GRID
+# Create many combinations and randomly select 50
+# ------------------------------------------------------------
+set.seed(123)
+
+full_grid <- expand.grid(
+  eta = c(0.01, 0.03, 0.05, 0.10, 0.20),
+  max_depth = c(2, 3, 4, 6, 8),
+  min_child_weight = c(1, 5),
+  subsample = c(0.7, 1.0),
+  colsample_bytree = c(0.7, 1.0),
+  gamma = c(0, 0.1)
+)
+
+# Randomly choose at most 50 models
+n_models <- min(50, nrow(full_grid))
+grid <- full_grid[sample(nrow(full_grid), n_models), ]
+
+# ------------------------------------------------------------
+# 6. CROSS-VALIDATION
+# ------------------------------------------------------------
+cv_results <- data.frame()
+
+for (i in 1:nrow(grid)) {
+
+  cat("Running model", i, "of", nrow(grid), "\n")
+
+  params <- list(
+    objective = "count:poisson",
+    eval_metric = "poisson-nloglik",
+    eta = grid$eta[i],
+    max_depth = grid$max_depth[i],
+    min_child_weight = grid$min_child_weight[i],
+    subsample = grid$subsample[i],
+    colsample_bytree = grid$colsample_bytree[i],
+    gamma = grid$gamma[i]
+  )
+
+  # 5-fold CV with early stopping
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,          # includes exposure via base_margin
+    nrounds = 5000,
+    nfold = 5,
+    early_stopping_rounds = 50,
+    maximize = FALSE,
+    verbose = 0
+  )
+
+  # Safe extraction of best iteration
+  best_iter <- cv$best_iteration
+  if (is.null(best_iter) || length(best_iter) == 0 || is.na(best_iter)) {
+    best_iter <- which.min(cv$evaluation_log$test_poisson_nloglik_mean)
+  }
+
+  # Best CV score
+  best_score <- cv$evaluation_log$test_poisson_nloglik_mean[best_iter]
+
+  # Save results
+  cv_results <- rbind(
+    cv_results,
+    data.frame(
+      Model = i,
+      eta = grid$eta[i],
+      max_depth = grid$max_depth[i],
+      min_child_weight = grid$min_child_weight[i],
+      subsample = grid$subsample[i],
+      colsample_bytree = grid$colsample_bytree[i],
+      gamma = grid$gamma[i],
+      Best_Rounds = best_iter,
+      CV_Poisson_NLogLik = best_score,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 7. SELECT BEST MODEL
+# ------------------------------------------------------------
+best_index <- which.min(cv_results$CV_Poisson_NLogLik)
+best_model_info <- cv_results[best_index, ]
+
+cat("\n==============================\n")
+cat("BEST HYPERPARAMETERS\n")
+cat("==============================\n")
+print(best_model_info)
+
+# Save tuning results
+write.csv(cv_results, "xgboost_cv_results.csv", row.names = FALSE)
+write.csv(best_model_info, "xgboost_best_model.csv", row.names = FALSE)
+
+# ------------------------------------------------------------
+# 8. TRAIN FINAL MODEL ON FULL TRAINING SET
+# Exposure is included in dtrain
+# ------------------------------------------------------------
+best_params <- list(
+  objective = "count:poisson",
+  eval_metric = "poisson-nloglik",
+  eta = best_model_info$eta,
+  max_depth = best_model_info$max_depth,
+  min_child_weight = best_model_info$min_child_weight,
+  subsample = best_model_info$subsample,
+  colsample_bytree = best_model_info$colsample_bytree,
+  gamma = best_model_info$gamma
+)
+
+xgb_final <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = best_model_info$Best_Rounds,
+  verbose = 0
+)
+
+# ------------------------------------------------------------
+# 9. TEST SET PREDICTIONS
+# Exposure is included automatically through dtest
+# ------------------------------------------------------------
+pred_test <- predict(xgb_final, dtest)
+
+# ------------------------------------------------------------
+# 10. TEST SET PERFORMANCE
+# ------------------------------------------------------------
+test_deviance <- poisson_deviance(y_test, pred_test)
+test_rmse <- sqrt(mean((y_test - pred_test)^2))
+
+cat("\n==============================\n")
+cat("TEST SET PERFORMANCE\n")
+cat("==============================\n")
+cat("Poisson Deviance:", test_deviance, "\n")
+cat("RMSE:", test_rmse, "\n")
+
+# ------------------------------------------------------------
+# 11. VARIABLE IMPORTANCE
+# ------------------------------------------------------------
+importance <- xgb.importance(model = xgb_final)
+print(head(importance, 20))
+
+write.csv(importance, "xgboost_variable_importance.csv", row.names = FALSE)
+
+# ------------------------------------------------------------
+# 12. PLOT: CV PERFORMANCE OF ALL MODELS
+# ------------------------------------------------------------
+p1 <- ggplot(cv_results,
+             aes(x = Model, y = CV_Poisson_NLogLik)) +
+  geom_line() +
+  geom_point() +
+  geom_point(
+    data = best_model_info,
+    aes(x = Model, y = CV_Poisson_NLogLik),
+    size = 4
+  ) +
+  labs(
+    title = "Cross-Validation Performance of XGBoost Models",
+    x = "Model Number",
+    y = "CV Poisson Negative Log-Likelihood"
+  ) +
+  theme_bw()
+
+print(p1)
+ggsave("xgboost_cv_performance.png", p1, width = 8, height = 5)
+
+# ------------------------------------------------------------
+# 13. PLOT: OBSERVED VS PREDICTED
+# ------------------------------------------------------------
+sample_idx <- sample(length(y_test), min(10000, length(y_test)))
+
+plot_data <- data.frame(
+  Observed = y_test[sample_idx],
+  Predicted = pred_test[sample_idx]
+)
+
+p2 <- ggplot(plot_data, aes(x = Predicted, y = Observed)) +
+  geom_point(alpha = 0.15) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Observed vs Predicted (Best XGBoost Model)",
+    x = "Predicted Claim Count",
+    y = "Observed Claim Count"
+  ) +
+  theme_bw()
+
+print(p2)
+ggsave("xgboost_observed_vs_predicted.png", p2, width = 7, height = 5)
+```
+

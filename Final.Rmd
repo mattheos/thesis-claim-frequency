@@ -1,0 +1,1231 @@
+```{r}
+# ============================================================
+# Comparative Model Analysis — Best Specifications
+# French Motor Insurance (freMTPL2freq)
+# All models fitted on 80/20 train/test split (seed = 123)
+# No cross-validataion — hyperparameters fixed to best configs
+# Outputs: results_df ready for ggplot graphing
+# ============================================================
+
+library(gbm)       # GBM
+library(xgboost)   # XGBoost
+library(mboost)    # GLMBoost
+library(dplyr)
+library(mgcv)      # GAM
+
+# ============================================================
+# 0. LOAD & PREPARE data
+# ============================================================
+data <- read.csv("C:/Users/matth/OneDrive/Desktop/Books/Thesis/Data/freMTPL2freq.csv", header = TRUE)
+
+data$ClaimNb  <- pmin(data$ClaimNb, 4)
+data$VehGas   <- factor(data$VehGas)
+data$VehBrand <- factor(data$VehBrand)
+data$Region   <- factor(data$Region)
+data$Area     <- factor(data$Area)
+data$VehPower <- as.numeric(data$VehPower)
+
+set.seed(123)
+n        <- nrow(data)
+train_id <- sample(seq_len(n), size = floor(0.8 * n))
+train    <- data[ train_id, ]
+test     <- data[-train_id, ]
+
+# ============================================================
+# Helper functions
+# ============================================================
+poisson_deviance <- function(y, mu) {
+  terms <- ifelse(y == 0, 0, y * log(y / mu)) - (y - mu)
+  2 * sum(terms)
+}
+
+rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
+
+results <- list()
+
+# ============================================================
+# 1. POISSON GLM
+#    All predictors except Density (dropped by stepwise AIC)
+# ============================================================
+cat("Fitting Poisson GLM...\n")
+
+glm_fit <- glm(
+  ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus +
+            VehBrand + VehGas + Area + Region +
+            offset(log(Exposure)),
+  data   = train,
+  family = poisson(link = "log")
+)
+
+glm_pred <- predict(glm_fit, newdata = test, type = "response")
+
+results[["Poisson GLM"]] <- data.frame(
+  Model         = "Poisson GLM",
+  Test_Deviance = poisson_deviance(test$ClaimNb, glm_pred),
+  Test_RMSE     = rmse(test$ClaimNb, glm_pred)
+)
+cat("  Done. Test deviance:", results[["Poisson GLM"]]$Test_Deviance, "\n")
+
+# ============================================================
+# 2. POISSON GAM — mB_cr
+#    s(VehPower) + s(DrivAge) + s(BonusMalus), bs="cr", REML
+#    + all categorical predictors
+# ============================================================
+cat("Fitting GAM (mB_cr)...\n")
+
+gam_fit <- gam(
+  ClaimNb ~ s(VehPower, bs = "cr") +
+            s(DrivAge,  bs = "cr") +
+            s(BonusMalus, bs = "cr") +
+            VehBrand + VehGas + Area + Region +
+            offset(log(Exposure)),
+  data   = train,
+  family = poisson(link = "log"),
+  method = "REML"
+)
+
+gam_pred <- predict(gam_fit, newdata = test, type = "response")
+
+results[["GAM"]] <- data.frame(
+  Model         = "GAM (mB_cr)",
+  Test_Deviance = poisson_deviance(test$ClaimNb, gam_pred),
+  Test_RMSE     = rmse(test$ClaimNb, gam_pred)
+)
+cat("  Done. Test deviance:", results[["GAM"]]$Test_Deviance, "\n")
+
+# ============================================================
+# 3. GBM — Interaction model (best of 5 configs)
+#    depth=6, lr=0.020, bag=0.5, min_obs=50, M*=3991
+#    predict.gbm does NOT add offset — add log(Exposure) manually
+# ============================================================
+cat("Fitting GBM (Interaction, M*=3991)...\n")
+
+set.seed(123)
+gbm_fit <- gbm(
+  ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus +
+            VehBrand + VehGas + Area + Region + Density +
+            offset(log(Exposure)),
+  data              = train,
+  distribution      = "poisson",
+  n.trees           = 3991,
+  interaction.depth = 6,
+  shrinkage         = 0.020,
+  bag.fraction      = 0.5,
+  n.minobsinnode    = 50,
+  verbose           = FALSE
+)
+
+# predict() returns log-rate (F(x) only, no offset) — add log(Exposure) manually
+gbm_pred_log <- predict(gbm_fit, newdata = test, n.trees = 3991)
+gbm_pred     <- exp(gbm_pred_log + log(test$Exposure))
+
+results[["GBM"]] <- data.frame(
+  Model         = "GBM (Interaction)",
+  Test_Deviance = poisson_deviance(test$ClaimNb, gbm_pred),
+  Test_RMSE     = rmse(test$ClaimNb, gbm_pred)
+)
+cat("  Done. Test deviance:", results[["GBM"]]$Test_Deviance, "\n")
+
+# ============================================================
+# 4. XGBoost — Model 36 best config
+#    eta=0.05, depth=8, min_child=1, sub=0.7, colsub=0.7,
+#    gamma=0, M*=490
+#    base_margin=log(Exposure) handles offset at DMatrix level
+# ============================================================
+cat("Fitting XGBoost (M*=490)...\n")
+
+train_mat <- model.matrix(~ VehPower + VehAge + DrivAge + BonusMalus +
+                            VehBrand + VehGas + Area + Region + Density - 1,
+                          data = train)
+test_mat  <- model.matrix(~ VehPower + VehAge + DrivAge + BonusMalus +
+                            VehBrand + VehGas + Area + Region + Density - 1,
+                          data = test)
+
+dtrain <- xgb.DMatrix(data = train_mat, label = train$ClaimNb,
+                      base_margin = log(train$Exposure))
+dtest  <- xgb.DMatrix(data = test_mat,  label = test$ClaimNb,
+                      base_margin = log(test$Exposure))
+
+xgb_params <- list(
+  objective        = "count:poisson",
+  eval_metric      = "poisson-nloglik",
+  eta              = 0.05,
+  max_depth        = 8,
+  min_child_weight = 1,
+  subsample        = 0.7,
+  colsample_bytree = 0.7,
+  gamma            = 0
+)
+
+set.seed(123)
+xgb_fit <- xgb.train(
+  params  = xgb_params,
+  data    = dtrain,
+  nrounds = 490,
+  verbose = 0
+)
+
+# predict() returns expected counts directly (base_margin already included)
+xgb_pred <- predict(xgb_fit, dtest)
+
+results[["XGBoost"]] <- data.frame(
+  Model         = "XGBoost",
+  Test_Deviance = poisson_deviance(test$ClaimNb, xgb_pred),
+  Test_RMSE     = rmse(test$ClaimNb, xgb_pred)
+)
+cat("  Done. Test deviance:", results[["XGBoost"]]$Test_Deviance, "\n")
+
+# ============================================================
+# 5. GLMBoost — nu=0.50, mstop=4473
+#    Offset entered via formula as offset(LogExp)
+#    predict() returns log-rate including offset — exponentiate directly
+# ============================================================
+cat("Fitting GLMBoost (nu=0.50, mstop=4473)...\n")
+
+train_glmb        <- train
+test_glmb         <- test
+train_glmb$LogExp <- log(train$Exposure)
+test_glmb$LogExp  <- log(test$Exposure)
+
+glmb_fit <- glmboost(
+  ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus +
+            VehBrand + VehGas + Area + Region + Density +
+            offset(LogExp),
+  data    = train_glmb,
+  family  = Poisson(),
+  control = boost_control(mstop = 4473, nu = 0.50, center = TRUE)
+)
+
+# predict() returns linear predictor including offset on log scale
+glmb_pred_log <- predict(glmb_fit, newdata = test_glmb)
+glmb_pred     <- exp(glmb_pred_log)
+
+results[["GLMBoost"]] <- data.frame(
+  Model         = "GLMBoost (nu=0.50)",
+  Test_Deviance = poisson_deviance(test$ClaimNb, glmb_pred),
+  Test_RMSE     = rmse(test$ClaimNb, glmb_pred)
+)
+cat("  Done. Test deviance:", results[["GLMBoost"]]$Test_Deviance, "\n")
+
+# ============================================================
+# 6. HYBRID GLM + GBM (Without Density)
+#    Stage 1: Poisson GLM (reuses glm_fit above)
+#    Stage 2: GBM correction with combined offset = log(Exposure) + eta_glm
+#    depth=3, M*=5318, lr=0.010, bag=0.7, min_obs=100
+#    predict.gbm does NOT add offset — add combined_offset manually
+# ============================================================
+cat("Fitting Hybrid GLM + GBM (Without Density, M*=5318)...\n")
+
+# Stage 1: extract GLM log-rate (linear predictor minus exposure offset)
+eta_train <- predict(glm_fit, newdata = train, type = "link") - log(train$Exposure)
+eta_test  <- predict(glm_fit, newdata = test,  type = "link") - log(test$Exposure)
+
+# Combined offset: log(Exposure) + GLM log-rate
+train$combined_offset <- log(train$Exposure) + eta_train
+test$combined_offset  <- log(test$Exposure)  + eta_test
+
+# Stage 2: GBM corrects residual log-rate left by GLM
+set.seed(123)
+hybrid_gbm_fit <- gbm(
+  ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus +
+            VehBrand + VehGas + Area + Region +
+            offset(combined_offset),
+  data              = train,
+  distribution      = "poisson",
+  n.trees           = 5318,
+  interaction.depth = 3,
+  shrinkage         = 0.010,
+  bag.fraction      = 0.7,
+  n.minobsinnode    = 100,
+  verbose           = FALSE
+)
+
+# predict() returns F(x) only — add combined_offset manually
+hybrid_pred_log <- predict(hybrid_gbm_fit, newdata = test, n.trees = 5318)
+hybrid_pred     <- exp(hybrid_pred_log + test$combined_offset)
+
+results[["Hybrid"]] <- data.frame(
+  Model         = "Hybrid GLM+GBM",
+  Test_Deviance = poisson_deviance(test$ClaimNb, hybrid_pred),
+  Test_RMSE     = rmse(test$ClaimNb, hybrid_pred)
+)
+cat("  Done. Test deviance:", results[["Hybrid"]]$Test_Deviance, "\n")
+
+# ============================================================
+# 7. COLLECT & SAVE RESULTS
+# ============================================================
+results_df <- bind_rows(results) %>%
+  arrange(Test_Deviance) %>%
+  mutate(
+    Rank          = row_number(),
+    Model         = factor(Model, levels = Model),
+    Test_Deviance = round(Test_Deviance, 2),
+    Test_RMSE     = round(Test_RMSE, 4)
+  )
+
+cat("\n========== FINAL RESULTS ==========\n")
+print(results_df)
+
+saveRDS(results_df, "results_df.rds")
+cat("\nSaved results_df.rds — load with readRDS('results_df.rds') for graphing.\n")
+```
+
+```{r}
+# =============================================================================
+# SUPER LEARNER — CLAIM FREQUENCY MODELLING (THESIS VERSION)
+# GLM + GAM + GBM + XGBOOST
+# Exposure handled consistently as offset(log(Exposure))
+# =============================================================================
+
+library(caret)
+library(SuperLearner)
+library(mgcv)
+library(gbm)
+library(xgboost)
+library(MASS)
+
+# =============================================================================
+# DATA
+# =============================================================================
+
+df <- read.csv(
+  "C:/Users/matth/OneDrive/Desktop/Books/Thesis/Data/freMTPL2freq.csv"
+)
+
+set.seed(123)
+
+# Ensure factors are consistent globally
+df$VehBrand <- factor(df$VehBrand)
+df$VehGas   <- factor(df$VehGas)
+df$Area     <- factor(df$Area)
+df$Region   <- factor(df$Region)
+
+# =============================================================================
+# TRAIN / TEST SPLIT
+# =============================================================================
+
+train_index <- createDataPartition(df$ClaimNb, p = 0.80, list = FALSE)
+
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+X_train <- train[, c("VehPower","VehAge","DrivAge","BonusMalus",
+                     "VehBrand","VehGas","Area","Density","Region")]
+
+X_test  <- test[, c("VehPower","VehAge","DrivAge","BonusMalus",
+                     "VehBrand","VehGas","Area","Density","Region")]
+
+Y_train <- train$ClaimNb
+Y_test  <- test$ClaimNb
+
+Exposure_train <- train$Exposure
+Exposure_test  <- test$Exposure
+
+# =============================================================================
+# METRICS
+# =============================================================================
+
+poisson_deviance <- function(y, mu) {
+  mu <- pmax(mu, 1e-15)
+  2 * sum(ifelse(y == 0, mu, y * log(y / mu) - (y - mu)))
+}
+
+rmse <- function(y, pred) sqrt(mean((y - pred)^2))
+
+# =============================================================================
+# 1. GLM WRAPPER
+# =============================================================================
+
+SL.glm.poisson <- function(Y, X, newX, family, obsWeights, ...) {
+
+  dat <- data.frame(X, ClaimNb = Y, Exposure = obsWeights)
+
+  mod <- glm(
+    ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus +
+      VehBrand + VehGas + Area + Density + Region +
+      offset(log(Exposure)),
+    family = poisson(),
+    data = dat
+  )
+
+  newdat <- data.frame(newX)
+  newdat$Exposure <- 1
+
+  pred <- predict(mod, newdata = newdat, type = "response")
+
+  list(fit = list(model = mod), pred = pred)
+}
+
+predict.SL.glm.poisson <- function(object, newdata, ...) {
+  nd <- data.frame(newdata)
+  nd$Exposure <- 1
+  predict(object$model, newdata = nd, type = "response")
+}
+
+# =============================================================================
+# 2. GAM WRAPPER
+# =============================================================================
+
+SL.gam.poisson <- function(Y, X, newX, family, obsWeights, ...) {
+
+  dat <- data.frame(X, ClaimNb = Y, Exposure = obsWeights)
+
+  mod <- gam(
+    ClaimNb ~
+      s(VehPower, k = 8, bs = "ps") +
+      s(DrivAge,  k = 8, bs = "ps") +
+      s(BonusMalus, k = 8, bs = "ps") +
+      VehAge + VehBrand + VehGas + Area + Region +
+      offset(log(Exposure)),
+    family = poisson(),
+    method = "REML",
+    data = dat
+  )
+
+  newdat <- data.frame(newX)
+  newdat$Exposure <- 1
+
+  pred <- predict(mod, newdata = newdat, type = "response")
+
+  list(fit = list(model = mod), pred = pred)
+}
+
+predict.SL.gam.poisson <- function(object, newdata, ...) {
+  nd <- data.frame(newdata)
+  nd$Exposure <- 1
+  predict(object$model, newdata = nd, type = "response")
+}
+
+# =============================================================================
+# 3. GBM WRAPPER (OFFSET CORRECTED)
+# =============================================================================
+
+SL.gbm.poisson <- function(Y, X, newX, family, obsWeights, ...) {
+
+  X <- data.frame(X)
+  newX <- data.frame(newX)
+
+  # Ensure factors are consistent
+  facs <- c("VehBrand","VehGas","Area","Region")
+
+  for (v in facs) {
+    X[[v]] <- factor(X[[v]])
+    newX[[v]] <- factor(newX[[v]], levels = levels(X[[v]]))
+  }
+
+  dat <- data.frame(X, ClaimNb = Y, LogExp = log(obsWeights))
+
+  mod <- gbm(
+    ClaimNb ~ . - LogExp + offset(LogExp),
+    data = dat,
+    distribution = "poisson",
+    n.trees = 5000,
+    interaction.depth = 6,
+    shrinkage = 0.02,
+    bag.fraction = 0.5,
+    n.minobsinnode = 100,
+    cv.folds = 0,
+    verbose = FALSE
+  )
+
+  pred <- predict(
+    mod,
+    newdata = newX,
+    n.trees = 3000,
+    type = "response"
+  )
+
+  list(fit = list(model = mod), pred = pred)
+}
+
+predict.SL.gbm.poisson <- function(object, newdata, ...) {
+
+  newdata <- data.frame(newdata)
+
+  facs <- c("VehBrand","VehGas","Area","Region")
+
+  for (v in facs) {
+    newdata[[v]] <- factor(newdata[[v]])
+  }
+
+  predict(
+    object$model,
+    newdata = newdata,
+    n.trees = 3000,
+    type = "response"
+  )
+}
+
+# =============================================================================
+# 4. XGBOOST WRAPPER (OFFSET CORRECT)
+# =============================================================================
+
+SL.xgb.poisson <- function(Y, X, newX, family, obsWeights, ...) {
+
+  Xmat <- model.matrix(~ . - 1, data = X)
+  Xnew <- model.matrix(~ . - 1, data = newX)
+
+  dtrain <- xgb.DMatrix(Xmat, label = Y)
+
+  setinfo(dtrain, "base_margin", log(obsWeights))
+
+  params <- list(
+    objective = "count:poisson",
+    eta = 0.005,
+    max_depth = 6,
+    subsample = 0.7,
+    colsample_bytree = 0.7,
+    lambda = 1
+  )
+
+  mod <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 5000,
+    verbose = 0
+  )
+
+  dtest <- xgb.DMatrix(Xnew)
+  setinfo(dtest, "base_margin", rep(0, nrow(Xnew)))
+
+  pred <- predict(mod, dtest)
+
+  list(
+    fit = list(model = mod, feature_names = colnames(Xmat)),
+    pred = pred
+  )
+}
+
+predict.SL.xgb.poisson <- function(object, newdata, ...) {
+
+  Xnew <- model.matrix(~ . - 1, data = newdata)
+
+  miss <- setdiff(object$feature_names, colnames(Xnew))
+
+  for (m in miss) {
+    Xnew <- cbind(Xnew, setNames(data.frame(0), m))
+  }
+
+  Xnew <- Xnew[, object$feature_names, drop = FALSE]
+
+  dtest <- xgb.DMatrix(Xnew)
+  setinfo(dtest, "base_margin", rep(0, nrow(Xnew)))
+
+  predict(object$model, dtest)
+}
+
+# =============================================================================
+# SUPER LEARNER FIT
+# =============================================================================
+
+sl_fit <- SuperLearner(
+  Y = Y_train,
+  X = X_train,
+  newX = X_test,
+  family = poisson(),
+  SL.library = c(
+    "SL.glm.poisson",
+    "SL.gam.poisson",
+    "SL.gbm.poisson",
+    "SL.xgb.poisson"
+  ),
+  method = "method.NNLS",
+  cvControl = list(V = 5),
+  obsWeights = Exposure_train,
+  verbose = TRUE
+)
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+
+SL_pred <- sl_fit$SL.predict * Exposure_test
+
+cat("\nSUPER LEARNER RESULTS\n")
+cat("---------------------\n")
+
+cat("Deviance:", poisson_deviance(Y_test, SL_pred), "\n")
+cat("RMSE    :", rmse(Y_test, SL_pred), "\n\n")
+
+print(sl_fit$coef)
+print(sl_fit$cvRisk)
+```
+
+```{r}
+# -----------------------------
+# METRICS
+# -----------------------------
+
+poisson_deviance <- function(y, mu) {
+  mu <- pmax(mu, 1e-15)
+  2 * sum(ifelse(y == 0, mu, y * log(y / mu) - (y - mu)))
+}
+
+rmse <- function(y, pred) sqrt(mean((y - pred)^2))
+
+mae <- function(y, pred) mean(abs(y - pred))
+
+gini_index <- function(y, pred) {
+  df <- data.frame(y = y, pred = pred)
+  df <- df[order(-df$pred), ]
+  cum_y <- cumsum(df$y)
+  gini <- sum(cum_y) / sum(df$y) - (nrow(df) + 1) / 2
+  gini / nrow(df)
+}
+
+# -----------------------------
+# PREDICTIONS (FIXED NAMES)
+# -----------------------------
+
+individual_preds <- sl_fit$library.predict
+
+glm_pred <- individual_preds[, "SL.glm.poisson_All"] * Exposure_test
+gam_pred <- individual_preds[, "SL.gam.poisson_All"] * Exposure_test
+gbm_pred <- individual_preds[, "SL.gbm.poisson_All"] * Exposure_test
+xgb_pred <- individual_preds[, "SL.xgb.poisson_All"] * Exposure_test
+
+sl_pred <- SL_pred
+
+# -----------------------------
+# COMPLEXITY SCORES
+# -----------------------------
+
+complexity_score <- c(
+  GLM = 1,
+  GAM = 2,
+  GBM = 3,
+  XGBoost = 4,
+  SuperLearner = 5
+)
+
+# -----------------------------
+# FINAL TABLE
+# -----------------------------
+
+results <- data.frame(
+  Model = c("SuperLearner", "XGBoost", "GAM", "GLM", "GBM"),
+
+  Deviance = c(
+    poisson_deviance(Y_test, sl_pred),
+    poisson_deviance(Y_test, xgb_pred),
+    poisson_deviance(Y_test, gam_pred),
+    poisson_deviance(Y_test, glm_pred),
+    poisson_deviance(Y_test, gbm_pred)
+  ),
+
+  RMSE = c(
+    rmse(Y_test, sl_pred),
+    rmse(Y_test, xgb_pred),
+    rmse(Y_test, gam_pred),
+    rmse(Y_test, glm_pred),
+    rmse(Y_test, gbm_pred)
+  ),
+
+  MAE = c(
+    mae(Y_test, sl_pred),
+    mae(Y_test, xgb_pred),
+    mae(Y_test, gam_pred),
+    mae(Y_test, glm_pred),
+    mae(Y_test, gbm_pred)
+  ),
+
+  Gini = c(
+    gini_index(Y_test, sl_pred),
+    gini_index(Y_test, xgb_pred),
+    gini_index(Y_test, gam_pred),
+    gini_index(Y_test, glm_pred),
+    gini_index(Y_test, gbm_pred)
+  ),
+
+  Complexity = c(
+    complexity_score["SuperLearner"],
+    complexity_score["XGBoost"],
+    complexity_score["GAM"],
+    complexity_score["GLM"],
+    complexity_score["GBM"]
+  )
+)
+
+# -----------------------------
+# OUTPUT
+# -----------------------------
+
+print(results)
+```
+
+--------------------------------------------------------------------------------------------------------------------------
+
+```{r}
+
+
+# ============================================================
+# BUILD PREDICTION DATA FRAME
+# ============================================================
+n_test <- 135602
+
+glm_pred    <- glm_pred[seq_len(n_test)]
+test_use    <- test[seq_len(n_test), ]
+pred_df <- data.frame(
+  y                = test_use$ClaimNb,
+  exposure         = test_use$Exposure,
+  `Poisson GLM`    = glm_pred,
+  GAM              = gam_pred,
+  GLMBoost         = glmb_pred,
+  `Hybrid GLM+GBM` = hybrid_pred,
+  GBM              = gbm_pred,
+  XGBoost          = xgb_pred,
+  `Super Learner`  = sl_pred,
+  check.names = FALSE
+)
+
+model_names <- c("Poisson GLM","GAM","GLMBoost","Hybrid GLM+GBM","GBM","XGBoost","Super Learner")
+
+group_map <- c(
+  "Poisson GLM"    = "Statistical",
+  "GAM"            = "Statistical",
+  "GLMBoost"       = "Statistical",
+  "Hybrid GLM+GBM" = "Hybrid",
+  "GBM"            = "Machine Learning",
+  "XGBoost"        = "Machine Learning",
+  "Super Learner"  = "Machine Learning"
+)
+
+# ============================================================
+# FIGURE 1 — PEARSON RESIDUAL PLOT (panelled by group)
+# ============================================================
+cat("Plotting Figure 1: Pearson Residuals...\n")
+
+resid_long <- pred_df %>%
+  pivot_longer(cols = all_of(model_names), names_to = "Model", values_to = "pred") %>%
+  mutate(
+    resid = pearson_resid(y, pred),
+    Group = group_map[Model],
+    Model = factor(Model, levels = model_names)
+  ) %>%
+  # thin to max 30,000 rows for speed (random sample)
+  slice_sample(n = min(30000, nrow(.)))
+
+fig_resid <- ggplot(resid_long, aes(x = pred, y = resid, colour = Model)) +
+  geom_point(alpha = 0.15, size = 0.4, shape = 16) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "black", linewidth = 0.5) +
+  facet_wrap(~ Group, ncol = 3, scales = "free_x") +
+  scale_colour_manual(values = model_colors) +
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.01)) +
+  coord_cartesian(ylim = c(-1.5, 4)) +
+  labs(
+    title    = "Residual Structure by Model Group",
+    subtitle = "Pearson residuals vs predicted claim frequency on the test set",
+    x        = "Predicted claim frequency",
+    y        = "Pearson residual",
+    colour   = "Model",
+    caption  = "Systematic patterns in the statistical group indicate structure not captured by additive or linear frameworks."
+  ) +
+  thesis_theme +
+  guides(colour = guide_legend(override.aes = list(alpha = 1, size = 2)))
+
+ggsave(file.path(OUTPUT_DIR, "fig_residuals.png"), fig_resid,
+       width = 12, height = 5, dpi = 300)
+cat("  Saved fig_residuals.png\n")
+
+# ============================================================
+# FIGURE 2 — CALIBRATION PLOT (10 predicted-frequency bands)
+# ============================================================
+cat("Plotting Figure 2: Calibration...\n")
+
+calib_models <- c("Poisson GLM","Hybrid GLM+GBM","GBM","XGBoost","Super Learner")
+
+calib_df <- pred_df %>%
+  pivot_longer(cols = all_of(calib_models), names_to = "Model", values_to = "pred") %>%
+  mutate(Model = factor(Model, levels = calib_models)) %>%
+  group_by(Model) %>%
+  mutate(decile = ntile(pred, 10)) %>%
+  group_by(Model, decile) %>%
+  summarise(
+    avg_pred = mean(pred),
+    avg_obs  = mean(y),
+    .groups  = "drop"
+  )
+
+fig_calib <- ggplot(calib_df, aes(x = avg_pred, y = avg_obs, colour = Model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.6) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  geom_point(size = 2.2) +
+  scale_colour_manual(values = model_colors[calib_models]) +
+  scale_x_continuous(labels = scales::number_format(accuracy = 0.001)) +
+  scale_y_continuous(labels = scales::number_format(accuracy = 0.001)) +
+  labs(
+    title    = "Calibration: Predicted vs Observed Claim Frequency",
+    subtitle = "Policies grouped into deciles of predicted frequency (test set)",
+    x        = "Average predicted frequency",
+    y        = "Average observed frequency",
+    colour   = "Model",
+    caption  = "Points on the dashed line indicate perfect calibration. Each point represents one decile of predicted frequency."
+  ) +
+  thesis_theme
+
+ggsave(file.path(OUTPUT_DIR, "fig_calibration.png"), fig_calib,
+       width = 8, height = 6, dpi = 300)
+cat("  Saved fig_calibration.png\n")
+
+
+
+# ============================================================
+# FIGURE 4 — DECILE LOSS RATIO CHART
+# ============================================================
+cat("Plotting Figure 4: Decile Chart...\n")
+
+decile_list <- lapply(model_names, function(m) {
+  pred_df %>%
+    mutate(decile = ntile(.data[[m]], 10)) %>%
+    group_by(decile) %>%
+    summarise(
+      avg_pred = mean(.data[[m]]),
+      avg_obs  = mean(y),
+      .groups  = "drop"
+    ) %>%
+    mutate(Model = m)
+})
+decile_df <- bind_rows(decile_list) %>%
+  mutate(Model = factor(Model, levels = model_names))
+
+fig_decile <- ggplot(decile_df, aes(x = decile)) +
+  geom_line(aes(y = avg_pred, colour = Model), linewidth = 0.8) +
+  geom_point(aes(y = avg_pred, colour = Model), size = 2) +
+  geom_line(aes(y = avg_obs,  colour = Model), linewidth = 0.5, linetype = "dotted") +
+  geom_point(aes(y = avg_obs, colour = Model), size = 1.2, shape = 1) +
+  scale_colour_manual(values = model_colors) +
+  scale_x_continuous(breaks = 1:10, labels = paste0("D", 1:10)) +
+  labs(
+    title    = "Predicted vs Observed Claim Frequency by Decile",
+    subtitle = "Solid line = predicted | Dotted line = observed (same colour per model)",
+    x        = "Decile of predicted frequency",
+    y        = "Average claim frequency",
+    colour   = "Model",
+    caption  = "Models closer to the observed line across all deciles exhibit better calibrated risk discrimination."
+  ) +
+  thesis_theme +
+  theme(axis.text.x = element_text(size = 9))
+
+ggsave(file.path(OUTPUT_DIR, "fig_decile.png"), fig_decile,
+       width = 10, height = 6, dpi = 300)
+cat("  Saved fig_decile.png\n")
+
+cat("\n========== ALL FIGURES SAVED ==========\n")
+cat("Location:", OUTPUT_DIR, "\n")
+cat("  fig_residuals.png\n")
+cat("  fig_calibration.png\n")
+cat("  fig_lift.png\n")
+cat("  fig_decile.png\n")
+
+# ============================================================
+# FIGURE 3 — CUMULATIVE LIFT CURVES (ranked by rate)
+# ============================================================
+cat("Plotting Figure 3: Lift Curves...\n")
+
+# Rank on rate (predicted counts / exposure), evaluate on counts
+pred_df_lift <- pred_df %>%
+  mutate(
+    `Poisson GLM`    = `Poisson GLM`    / exposure,
+    GAM              = GAM              / exposure,
+    GLMBoost         = GLMBoost         / exposure,
+    `Hybrid GLM+GBM` = `Hybrid GLM+GBM` / exposure,
+    GBM              = GBM              / exposure,
+    XGBoost          = XGBoost          / exposure,
+    `Super Learner`  = `Super Learner`  / exposure
+  )
+
+lift_df <- bind_rows(lapply(model_names, function(m) {
+  d <- pred_df_lift[order(-pred_df_lift[[m]]), ]
+  data.frame(
+    Model      = m,
+    pct_policy = seq_len(nrow(d)) / nrow(d),
+    cum_lift   = cumsum(pred_df$y[order(-pred_df_lift[[m]])]) / sum(pred_df$y)
+  )
+})) %>%
+  mutate(Model = factor(Model, levels = model_names)) %>%
+  group_by(Model) %>%
+  filter(row_number() %% 50 == 0 | row_number() == n()) %>%
+  ungroup()
+
+fig_lift <- ggplot(lift_df, aes(x = pct_policy, y = cum_lift, colour = Model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.6) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  scale_colour_manual(values = model_colors) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Cumulative Lift Curves",
+    subtitle = "Policies ranked by predicted claim rate (descending) — test set",
+    x        = "Proportion of policies",
+    y        = "Cumulative share of observed claims",
+    colour   = "Model",
+    caption  = "Higher and earlier separation from the diagonal indicates better risk discrimination."
+  ) +
+  thesis_theme
+
+ggsave(file.path(OUTPUT_DIR, "fig_lift.png"), fig_lift,
+       width = 8, height = 6, dpi = 300)
+cat("  Saved fig_lift.png\n")
+```
+
+```{r}
+# ============================================================
+# SUPER LEARNER COMPARISON GRAPHS — All 5 versions
+# ============================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(ggrepel)   # for label repelling in scatter plot
+
+# ============================================================
+# BASE DATA
+# ============================================================
+
+sl_data <- data.frame(
+  Model       = c("GLM", "GAM", "GBM", "XGBoost"),
+  Individual  = c(42857.21, 42808.10, 40640.95, 40209.07),
+  SL_Deviance = c(42859.67, 42584.55, 40614.69, 40360.14),
+  SL_Weight   = round(sl_fit$coef[c("SL.glm.poisson_All","SL.gam.poisson_All",
+                                     "SL.gbm.poisson_All","SL.xgb.poisson_All")] * 100, 1),
+  RMSE        = c(0.2355, 0.2351, 0.2339, 0.2334),
+  MAE         = c(0.09843, 0.09810, 0.09603, 0.09589),
+  Gini        = c(0.1304, 0.1382, 0.1794, 0.1833)
+) %>%
+  mutate(
+    Model = factor(Model, levels = c("GLM","GAM","GBM","XGBoost")),
+    Ind_Rank = rank(Individual),
+    Weight_Rank = rank(-SL_Weight)
+  )
+
+# ============================================================
+# GRAPH 1 — SCATTER: Deviance vs SL Weight
+# ============================================================
+cat("Plotting Graph 1: Scatter...\n")
+
+fig_scatter <- ggplot(sl_data, aes(x = Individual, y = SL_Weight,
+                                    size = RMSE, colour = Model)) +
+  geom_point(alpha = 0.85) +
+  geom_text_repel(
+    aes(label = paste0(Model, "\n(weight: ", SL_Weight, "%)")),
+    size = 3.2, show.legend = FALSE, fontface = "italic",
+    box.padding = 0.6, point.padding = 0.4
+  ) +
+  scale_colour_manual(values = c(
+    "GLM"     = "#7F7F7F",
+    "GAM"     = "#AEC6CF",
+    "GBM"     = "#E84B3A",
+    "XGBoost" = "#2CA02C"
+  )) +
+  scale_size_continuous(range = c(4, 12), name = "RMSE") +
+  scale_x_continuous(labels = comma_format()) +
+  labs(
+    title    = "Does the Super Learner Reward the Best Individual Models?",
+    subtitle = "X-axis: individual test deviance | Y-axis: stacking weight assigned by Super Learner\nPoint size proportional to RMSE",
+    x        = "Individual Test Deviance (lower is better)",
+    y        = "Super Learner Stacking Weight (%)",
+    colour   = "Model",
+    caption  = "GBM receives zero weight despite strong individual deviance, while GAM receives 35% weight.\nThis suggests the Super Learner selects for complementarity, not just individual performance."
+  ) +
+  thesis_theme +
+  theme(legend.position = "right")
+
+ggsave(file.path(OUTPUT_DIR, "fig_sl_scatter.png"), fig_scatter,
+       width = 9, height = 6, dpi = 300)
+cat("  Saved fig_sl_scatter.png\n")
+
+# ============================================================
+# GRAPH 2 — RADAR CHART
+# ============================================================
+cat("Plotting Graph 2: Radar Chart...\n")
+
+# Normalise all metrics to 0-1 (1 = best)
+radar_df <- sl_data %>%
+  mutate(
+    Dev_norm    = 1 - (Individual   - min(Individual))   / (max(Individual)   - min(Individual)),
+    RMSE_norm   = 1 - (RMSE         - min(RMSE))         / (max(RMSE)         - min(RMSE)),
+    MAE_norm    = 1 - (MAE          - min(MAE))          / (max(MAE)          - min(MAE)),
+    Gini_norm   =     (Gini         - min(Gini))         / (max(Gini)         - min(Gini)),
+    Weight_norm =     (SL_Weight    - min(SL_Weight))    / (max(SL_Weight)    - min(SL_Weight))
+  ) %>%
+  select(Model, Dev_norm, RMSE_norm, MAE_norm, Gini_norm, Weight_norm) %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = recode(Metric,
+    "Dev_norm"    = "Deviance",
+    "RMSE_norm"   = "RMSE",
+    "MAE_norm"    = "MAE",
+    "Gini_norm"   = "Gini",
+    "Weight_norm" = "SL Weight"
+  ))
+
+# Close the polygon
+radar_closed <- radar_df %>%
+  group_by(Model) %>%
+  group_modify(~ bind_rows(.x, .x[1, ])) %>%
+  ungroup()
+
+metrics      <- unique(radar_df$Metric)
+n_metrics    <- length(metrics)
+angles       <- seq(0, 2 * pi, length.out = n_metrics + 1)[-(n_metrics + 1)]
+angle_df     <- data.frame(Metric = metrics, angle = angles)
+
+radar_plot_df <- radar_df %>%
+  left_join(angle_df, by = "Metric") %>%
+  mutate(
+    x = Value * cos(angle),
+    y = Value * sin(angle)
+  ) %>%
+  group_by(Model) %>%
+  arrange(angle) %>%
+  bind_rows(
+    radar_df %>%
+      left_join(angle_df, by = "Metric") %>%
+      mutate(x = Value * cos(angle), y = Value * sin(angle)) %>%
+      group_by(Model) %>%
+      slice(1)
+  ) %>%
+  ungroup()
+
+# Grid circles
+grid_df <- expand.grid(
+  r      = c(0.25, 0.5, 0.75, 1.0),
+  theta  = seq(0, 2 * pi, length.out = 100)
+) %>%
+  mutate(x = r * cos(theta), y = r * sin(theta))
+
+# Axis lines
+axis_df <- angle_df %>%
+  mutate(x_end = cos(angle), y_end = sin(angle))
+
+# Labels
+label_df <- angle_df %>%
+  mutate(
+    x = 1.18 * cos(angle),
+    y = 1.18 * sin(angle)
+  )
+
+fig_radar <- ggplot() +
+  geom_path(data = grid_df, aes(x = x, y = y, group = r),
+            colour = "grey85", linewidth = 0.4) +
+  geom_segment(data = axis_df,
+               aes(x = 0, y = 0, xend = x_end, yend = y_end),
+               colour = "grey80", linewidth = 0.4) +
+  geom_polygon(data = radar_plot_df,
+               aes(x = x, y = y, fill = Model, colour = Model),
+               alpha = 0.15, linewidth = 0.8) +
+  geom_point(data = radar_plot_df,
+             aes(x = x, y = y, colour = Model), size = 2) +
+  geom_text(data = label_df,
+            aes(x = x, y = y, label = Metric),
+            size = 3.5, fontface = "bold", colour = "grey30") +
+  scale_colour_manual(values = c(
+    "GLM"     = "#7F7F7F",
+    "GAM"     = "#AEC6CF",
+    "GBM"     = "#E84B3A",
+    "XGBoost" = "#2CA02C"
+  )) +
+  scale_fill_manual(values = c(
+    "GLM"     = "#7F7F7F",
+    "GAM"     = "#AEC6CF",
+    "GBM"     = "#E84B3A",
+    "XGBoost" = "#2CA02C"
+  )) +
+  coord_equal() +
+  labs(
+    title    = "Model Profile: Performance Metrics and Super Learner Weight",
+    subtitle = "All metrics normalised to 0–1 (1 = best performance)",
+    colour   = "Model", fill = "Model",
+    caption  = "Deviance, RMSE, MAE: lower is better (inverted). Gini and SL Weight: higher is better."
+  ) +
+  thesis_theme +
+  theme(
+    axis.text  = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "bottom"
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig_sl_radar.png"), fig_radar,
+       width = 8, height = 8, dpi = 300)
+cat("  Saved fig_sl_radar.png\n")
+
+# ============================================================
+# GRAPH 3 — SLOPE / BUMP CHART
+# ============================================================
+cat("Plotting Graph 3: Slope Chart...\n")
+
+slope_df <- data.frame(
+  Model        = c("GLM", "GAM", "GBM", "XGBoost"),
+  Ind_Rank     = c(4, 3, 2, 1),   # rank by individual deviance (1 = best)
+  Weight_Rank  = c(3, 2, 4, 1)    # rank by SL weight (1 = highest weight)
+) %>%
+  mutate(Model = factor(Model, levels = c("GLM","GAM","GBM","XGBoost"))) %>%
+  pivot_longer(cols = c(Ind_Rank, Weight_Rank),
+               names_to = "Context", values_to = "Rank") %>%
+  mutate(Context = recode(Context,
+    "Ind_Rank"    = "Individual\nRanking",
+    "Weight_Rank" = "Super Learner\nWeight Ranking"
+  ))
+
+fig_slope <- ggplot(slope_df, aes(x = Context, y = Rank,
+                                   group = Model, colour = Model)) +
+  geom_line(linewidth = 1.8, alpha = 0.85) +
+  geom_point(size = 5) +
+  geom_text(
+    data = slope_df %>% filter(Context == "Individual\nRanking"),
+    aes(label = Model), hjust = 1.3, size = 3.5, fontface = "bold"
+  ) +
+  geom_text(
+    data = slope_df %>% filter(Context == "Super Learner\nWeight Ranking"),
+    aes(label = paste0(Model, "\n(",
+                       c("3.5%","35.0%","0.0%","61.6%")[as.numeric(Model)],
+                       ")")),
+    hjust = -0.15, size = 3.5, fontface = "bold"
+  ) +
+  scale_y_reverse(breaks = 1:4, labels = c("1st","2nd","3rd","4th")) +
+  scale_colour_manual(values = c(
+    "GLM"     = "#7F7F7F",
+    "GAM"     = "#AEC6CF",
+    "GBM"     = "#E84B3A",
+    "XGBoost" = "#2CA02C"
+  )) +
+  labs(
+    title    = "How the Super Learner Re-ranks Individual Models",
+    subtitle = "Left: ranking by individual test deviance | Right: ranking by Super Learner stacking weight",
+    x        = NULL,
+    y        = "Rank",
+    caption  = "GBM drops from 2nd to last (zero weight). GAM rises from 3rd to 2nd.\nXGBoost remains dominant. This reflects complementarity, not just individual performance."
+  ) +
+  thesis_theme +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(face = "bold", size = 11),
+    panel.grid      = element_blank()
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig_sl_slope.png"), fig_slope,
+       width = 8, height = 6, dpi = 300)
+cat("  Saved fig_sl_slope.png\n")
+
+# ============================================================
+# GRAPH 4 — DOT PLOT WITH DUAL METRICS
+# ============================================================
+cat("Plotting Graph 4: Dot Plot...\n")
+
+dot_long <- sl_data %>%
+  select(Model, Individual, SL_Deviance, SL_Weight) %>%
+  pivot_longer(cols = c(Individual, SL_Deviance),
+               names_to = "Context", values_to = "Deviance") %>%
+  mutate(
+    Context = recode(Context,
+      "Individual"  = "Individually Fitted",
+      "SL_Deviance" = "Evaluated in SL Framework"
+    ),
+    Model = factor(Model, levels = c("XGBoost","GBM","GAM","GLM"))
+  )
+
+fig_dot <- ggplot(dot_long, aes(x = Deviance, y = Model, colour = Context, shape = Context)) +
+  geom_line(aes(group = Model), colour = "grey75", linewidth = 1.2) +
+  geom_point(size = 5, alpha = 0.9) +
+  geom_text(
+    data = sl_data %>% mutate(Model = factor(Model, levels = c("XGBoost","GBM","GAM","GLM"))),
+    aes(x = pmin(Individual, SL_Deviance) - 60,
+        y = Model,
+        label = paste0(SL_Weight, "%")),
+    inherit.aes = FALSE,
+    size = 3.2, colour = "grey30", fontface = "bold"
+  ) +
+  annotate("text", x = min(sl_data$Individual) - 120,
+           y = 4.45, label = "SL\nweight", size = 2.8,
+           colour = "grey40", fontface = "italic") +
+  scale_colour_manual(values = c(
+    "Individually Fitted"        = "#E84B3A",
+    "Evaluated in SL Framework"  = "#5B9BD5"
+  )) +
+  scale_shape_manual(values = c(
+    "Individually Fitted"        = 16,
+    "Evaluated in SL Framework"  = 17
+  )) +
+  scale_x_continuous(labels = comma_format(), limits = c(39900, 43200)) +
+  labs(
+    title    = "Model Deviance: Individually Fitted vs Evaluated in Super Learner Framework",
+    subtitle = "Each line connects the same model across two evaluation contexts.\nSL weight shown on the left.",
+    x        = "Poisson Deviance (lower is better)",
+    y        = NULL,
+    colour   = NULL, shape = NULL,
+    caption  = "Differences between contexts reflect different train/test splits. Relative ordering within each context is the key comparison."
+  ) +
+  thesis_theme +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(OUTPUT_DIR, "fig_sl_dot.png"), fig_dot,
+       width = 9, height = 5, dpi = 300)
+cat("  Saved fig_sl_dot.png\n")
+
+# ============================================================
+# GRAPH 5 — HEATMAP
+# ============================================================
+cat("Plotting Graph 5: Heatmap...\n")
+
+heat_df <- sl_data %>%
+  mutate(
+    Deviance_norm = 1 - (Individual - min(Individual)) / (max(Individual) - min(Individual)),
+    RMSE_norm     = 1 - (RMSE - min(RMSE))             / (max(RMSE) - min(RMSE)),
+    MAE_norm      = 1 - (MAE - min(MAE))               / (max(MAE) - min(MAE)),
+    Gini_norm     =     (Gini - min(Gini))             / (max(Gini) - min(Gini)),
+    Weight_norm   =     (SL_Weight - min(SL_Weight))   / (max(SL_Weight) - min(SL_Weight))
+  ) %>%
+  select(Model, Deviance_norm, RMSE_norm, MAE_norm, Gini_norm, Weight_norm) %>%
+  pivot_longer(cols = -Model, names_to = "Metric", values_to = "Score") %>%
+  mutate(
+    Metric = recode(Metric,
+      "Deviance_norm" = "Deviance",
+      "RMSE_norm"     = "RMSE",
+      "MAE_norm"      = "MAE",
+      "Gini_norm"     = "Gini",
+      "Weight_norm"   = "SL Weight"
+    ),
+    Metric = factor(Metric, levels = c("Deviance","RMSE","MAE","Gini","SL Weight")),
+    Model  = factor(Model,  levels = c("GLM","GAM","GBM","XGBoost")),
+    Label  = round(case_when(
+      Metric == "Deviance"  ~ sl_data$Individual[match(Model, sl_data$Model)],
+      Metric == "RMSE"      ~ sl_data$RMSE[match(Model, sl_data$Model)],
+      Metric == "MAE"       ~ sl_data$MAE[match(Model, sl_data$Model)],
+      Metric == "Gini"      ~ sl_data$Gini[match(Model, sl_data$Model)],
+      Metric == "SL Weight" ~ sl_data$SL_Weight[match(Model, sl_data$Model)]
+    ), 4)
+  )
+
+fig_heat <- ggplot(heat_df, aes(x = Metric, y = Model, fill = Score)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(aes(label = Label), size = 3.2, colour = "grey20", fontface = "bold") +
+  scale_fill_gradient2(
+    low      = "#d73027",
+    mid      = "#ffffbf",
+    high     = "#1a9850",
+    midpoint = 0.5,
+    name     = "Relative\nScore"
+  ) +
+  labs(
+    title    = "Full Performance Profile: Individual Metrics and Super Learner Weight",
+    subtitle = "Colour shows relative performance (green = best, red = worst) within each metric.\nActual values shown inside cells.",
+    x        = NULL,
+    y        = NULL,
+    caption  = "Deviance, RMSE, MAE: lower is better (colour inverted). Gini and SL Weight: higher is better."
+  ) +
+  thesis_theme +
+  theme(
+    legend.position = "right",
+    panel.grid      = element_blank(),
+    axis.text.x     = element_text(face = "bold", size = 11),
+    axis.text.y     = element_text(face = "bold", size = 11)
+  )
+
+ggsave(file.path(OUTPUT_DIR, "fig_sl_heatmap.png"), fig_heat,
+       width = 9, height = 5, dpi = 300)
+cat("  Saved fig_sl_heatmap.png\n")
+
+cat("\n========== ALL SL COMPARISON GRAPHS SAVED ==========\n")
+```
+

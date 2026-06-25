@@ -1,0 +1,90 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(gbm)
+library(dplyr)
+library(ggplot2)
+library(MASS)
+library(mboost)
+library(caret)
+library(tidyr)
+
+data <- read.csv("C:/Users/matth/OneDrive/Desktop/Books/Thesis/Data/freMTPL2freq.csv", header = TRUE)
+
+df <- data %>%
+  mutate(
+    ClaimFreq = ClaimNb / Exposure,
+    VehBrand = as.factor(VehBrand),
+    VehGas   = as.factor(VehGas),
+    Area     = as.factor(Area),
+    Region   = as.factor(Region)
+  )
+
+set.seed(123)
+train_index <- createDataPartition(
+  df$ClaimNb,
+  p = 0.8,
+  list = FALSE
+)
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+# ─────────────────────────────────────────
+# Helper function: fit, CV, predict, clean
+# ─────────────────────────────────────────
+fit_glmboost_nu <- function(nu, train, test, mstop_max = 4500) {
+  cat("Fitting GLMBoost with nu =", nu, "...\n")
+  
+  model <- glmboost(
+    ClaimNb ~ VehPower + VehAge + DrivAge + BonusMalus +
+      VehBrand + VehGas + Area + Density + Region +
+      offset(log(Exposure)),
+    data    = train,
+    family  = Poisson(),
+    center  = TRUE,
+    control = boost_control(mstop = mstop_max, nu = nu)
+  )
+  
+  folds   <- cv(model.weights(model), type = "kfold", B = 5)
+  cv_risk <- cvrisk(model, folds = folds)
+  best    <- mstop(cv_risk)
+  final   <- model[best]
+  preds   <- predict(final, newdata = test, type = "response")
+  
+  cat("  → Best mstop:", best, "\n")
+  
+  rm(model, folds, cv_risk, final)
+  gc()
+  
+  list(preds = preds, best_mstop = best)
+}
+
+# ─────────────────────────────────────────
+# Run all nu values sequentially
+# ─────────────────────────────────────────
+nu_values <- c(0.01, 0.05, 0.1, 0.25, 0.5)
+results   <- list()
+
+for (nu in nu_values) {
+  results[[as.character(nu)]] <- fit_glmboost_nu(nu, train, test)
+  gc()
+}
+
+# ─────────────────────────────────────────
+# Extract predictions and best mstop values
+# ─────────────────────────────────────────
+test_pred_nu01 <- results[["0.01"]]$preds
+test_pred_nu05 <- results[["0.05"]]$preds
+test_pred_nu10 <- results[["0.1"]]$preds
+test_pred_nu25 <- results[["0.25"]]$preds
+test_pred_nu50 <- results[["0.5"]]$preds
+
+best_mstop_nu01 <- results[["0.01"]]$best_mstop
+best_mstop_nu05 <- results[["0.05"]]$best_mstop
+best_mstop_nu10 <- results[["0.1"]]$best_mstop
+best_mstop_nu25 <- results[["0.25"]]$best_mstop
+best_mstop_nu50 <- results[["0.5"]]$best_mstop
+```
